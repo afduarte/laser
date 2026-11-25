@@ -1,0 +1,5 @@
+/* Tailwind + Reclaim bridge. The bridge lives in the sibling reclaim-ui
+   checkout at ../../reclaim-ui; Tailwind also needs to scan those component
+   files for the few utility classes they use (e.g. the Button spinner). */
+@import "@reclaim/ui/styles/tailwind.css";
+@source "../../../reclaim-ui/packages/ui/src/components";
