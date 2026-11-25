@@ -1,7 +1,52 @@
 // Pure G-code parser for the Lasertools / Marlin laser output.
 // No DOM, no hardware — safe to unit-test under plain Node.
+//
+// Scope: linear moves (arcs are approximated as straight lines, with a
+// warning), M3/M4/M5 laser control, G90/G91, N line numbers, *checksums,
+// and modal bare-axis continuation lines. Anything else is ignored.
 
 const WORD_RE = /([A-Za-z])\s*(-?(?:\d+\.?\d*|\.\d+))/g;
+
+/**
+ * Split a line into word matches: [full, letter, numericText] triples.
+ * Shared by the parser, the crosshair tracker, and firing-line detection so
+ * there is exactly one definition of "a G-code word" in the app.
+ * @param {string} line
+ */
+export function wordsOf(line) {
+  return [...String(line ?? "").matchAll(WORD_RE)];
+}
+
+/** G00 → G0, M03 → M3; other codes unchanged. */
+function normalizeCode(code) {
+  return code.replace(/^([GM])0+(\d+)$/, "$1$2");
+}
+
+/** Drop a leading N line-number word, if present. */
+function withoutLineNumber(words) {
+  return words[0]?.[1].toUpperCase() === "N" ? words.slice(1) : words;
+}
+
+/**
+ * S power when the line switches the laser on (M3/M4), else null.
+ * M3 without an S word reports 0 (the firmware keeps the previous power,
+ * but there is nothing explicit to show).
+ * @param {string} line
+ * @returns {number | null}
+ */
+export function firingPower(line) {
+  const words = withoutLineNumber(wordsOf(line));
+  if (!words.length) return null;
+  const cmd = normalizeCode(words[0][0].toUpperCase());
+  if (cmd !== "M3" && cmd !== "M4") return null;
+  for (let i = 1; i < words.length; i++) {
+    if (words[i][1].toUpperCase() === "S") {
+      const value = Number.parseFloat(words[i][2]);
+      return Number.isFinite(value) ? value : 0;
+    }
+  }
+  return 0;
+}
 
 /**
  * Parse a .ngc/.gcode text blob.
@@ -14,6 +59,9 @@ const WORD_RE = /([A-Za-z])\s*(-?(?:\d+\.?\d*|\.\d+))/g;
  *   stats: {lineCount:number, fireCount:number, travelCount:number},
  *   warnings: string[]
  * }}
+ *
+ * stats.fireCount counts M3/M4 commands with S > 0 (not firing segments);
+ * stats.travelCount counts non-firing XY segments.
  */
 export function parseGcode(text) {
   const lines = [];
@@ -29,6 +77,7 @@ export function parseGcode(text) {
   let absolute = true;
   let laserOn = false;
   let power = 0;
+  let lastMotion = null; // modal G0/G1/G2/G3 for bare-axis continuation lines
 
   let minX = Infinity;
   let minY = Infinity;
@@ -36,24 +85,30 @@ export function parseGcode(text) {
   let maxY = -Infinity;
 
   for (const raw of String(text ?? "").split(/\r?\n/)) {
-    const line = raw.split(";")[0].trim();
+    const line = raw.split(";")[0].replace(/\*\d+\s*$/, "").trim();
     if (!line) continue;
 
     lines.push(line);
     lineCount++;
 
-    const words = [...line.matchAll(WORD_RE)];
+    const words = withoutLineNumber(wordsOf(line));
     if (words.length === 0) continue;
 
-    const cmd = words[0][0].toUpperCase();
+    const firstLetter = words[0][1].toUpperCase();
+
+    // Modal continuation: a line starting with an axis word repeats the
+    // previous motion mode ("X10 Y20" after a G1 is another G1).
+    const modal = "XYZ".includes(firstLetter) && lastMotion !== null;
+    const cmd = modal ? lastMotion : normalizeCode(words[0][0].toUpperCase());
+    const paramWords = modal ? words : words.slice(1);
+
     const params = {};
-    for (let i = 1; i < words.length; i++) {
-      const letter = words[i][1].toUpperCase();
-      params[letter] = parseFloat(words[i][2]);
+    for (const [, letter, raw] of paramWords) {
+      params[letter.toUpperCase()] = parseFloat(raw);
     }
 
-    const isTravel = cmd === "G0" || cmd === "G00";
-    const isMove = isTravel || cmd === "G1" || cmd === "G01" || cmd === "G2" || cmd === "G3";
+    const isTravel = cmd === "G0";
+    const isMove = isTravel || cmd === "G1" || cmd === "G2" || cmd === "G3";
 
     if (cmd === "G90") {
       absolute = true;
@@ -88,14 +143,15 @@ export function parseGcode(text) {
     }
 
     // A bare S word updates the power while the laser is on.
-    // The first word is the command itself, so its numeric value is words[0][2].
-    if (cmd[0] === "S") {
+    if (!modal && firstLetter === "S") {
       const value = Number.parseFloat(words[0][2]);
       if (laserOn && Number.isFinite(value)) power = value;
       continue;
     }
 
     if (isMove) {
+      lastMotion = cmd;
+
       const x0 = x;
       const y0 = y;
       let x1 = x;

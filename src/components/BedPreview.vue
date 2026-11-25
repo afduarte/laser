@@ -229,9 +229,17 @@ function resize() {
   draw();
 }
 
-function requestDraw() {
-  staticDirty = true;
-  draw();
+// Coalesce repaints into one animation frame: during a job stream the
+// crosshair can change several times per tick, but only the last one matters.
+let frame = 0;
+
+function scheduleDraw(rebuildStatic = false) {
+  if (rebuildStatic) staticDirty = true;
+  if (frame) return;
+  frame = requestAnimationFrame(() => {
+    frame = 0;
+    draw();
+  });
 }
 
 onMounted(() => {
@@ -243,17 +251,19 @@ onMounted(() => {
 onBeforeUnmount(() => {
   observer?.disconnect();
   observer = null;
+  if (frame) cancelAnimationFrame(frame);
+  frame = 0;
 });
 
-watch(() => state.job, requestDraw);
-watch(() => state.showTravel, requestDraw);
-watch(() => state.powerScale, requestDraw);
-watch(() => state.pos, draw, { deep: true });
+watch(() => state.job, () => scheduleDraw(true));
+watch(() => state.showTravel, () => scheduleDraw(true));
+watch(() => state.powerScale, () => scheduleDraw(true));
+watch(() => state.pos, () => scheduleDraw());
 watch(
   () => state.dark,
   () => {
     clearPalette();
-    requestDraw();
+    scheduleDraw(true);
   },
   { flush: "post" },
 );

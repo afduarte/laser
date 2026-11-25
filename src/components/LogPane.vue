@@ -1,15 +1,25 @@
 <script setup>
-import { nextTick, ref, watch } from "vue";
+import { ref, watch } from "vue";
 import { Button } from "@reclaim/ui";
 
 import { state } from "../lib/store.js";
 
 const box = ref(null);
 
+// Follow new output only while the user is parked at the bottom; scrolling
+// up to read history must not be yanked back down on every serial line.
+let pinned = true;
+
+function onScroll() {
+  const el = box.value;
+  if (!el) return;
+  pinned = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+}
+
 watch(
   () => state.log.length,
-  async () => {
-    await nextTick();
+  () => {
+    if (!pinned) return;
     const el = box.value;
     if (el) el.scrollTop = el.scrollHeight;
   },
@@ -29,6 +39,7 @@ function toneClass(tone) {
 
 function clear() {
   state.log.splice(0, state.log.length);
+  pinned = true;
 }
 </script>
 
@@ -38,11 +49,15 @@ function clear() {
       <h2 class="text-xs font-medium">Console</h2>
       <Button variant="ghost" size="sm" :disabled="!state.log.length" @click="clear">Clear</Button>
     </div>
-    <div ref="box" class="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed">
+    <div
+      ref="box"
+      class="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed"
+      @scroll="onScroll"
+    >
       <p v-if="!state.log.length" class="text-ink-faint">No serial traffic yet.</p>
       <div
-        v-for="(line, index) in state.log"
-        :key="index"
+        v-for="line in state.log"
+        :key="line.id"
         class="whitespace-pre-wrap break-all"
         :class="toneClass(line.tone)"
       >{{ line.text }}</div>

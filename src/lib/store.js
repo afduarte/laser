@@ -1,62 +1,25 @@
 // Reactive application state and every machine action.
-// UI code calls these functions; hardware access lives in marlin.js.
+// UI code calls these functions; hardware access lives in marlin.js,
+// persistence in settings.js, the confirmation dialog in confirm.js.
+//
+// Connection/manual state is one status value instead of a flag soup:
+//   offline → connecting → ready ⇄ busy → running → disconnecting → offline
+// `homed` and `stopRequested` are orthogonal flags. UI enablement is derived
+// here once (canJog / canRun / canDots) so panels cannot drift apart.
 
-import { computed, reactive, watch } from "vue";
+import { computed, reactive } from "vue";
 import { toast } from "@reclaim/ui";
 
 import { Marlin } from "./marlin.js";
-import { overridePower, parseGcode } from "./gcode.js";
+import { firingPower, overridePower, parseGcode, wordsOf } from "./gcode.js";
+import { confirmDialog } from "./confirm.js";
+import { loadSettings, persistSettings } from "./settings.js";
 
 export const BED = 220;
 export const XY_MAX = 220;
 export const Z_MAX = 250;
 
-const KEYS = {
-  focusZ: "laser.focus_z",
-  dotPower: "laser.dotPower",
-  dotMs: "laser.dotMs",
-  step: "laser.step",
-  overrideS: "laser.overrideS",
-  overrideEnabled: "laser.overrideEnabled",
-  dryRun: "laser.dryRun",
-  dark: "laser.dark",
-  powerScale: "laser.powerScale",
-};
-
-const LASER_ON_RE = /^([MG]\d+)\s+S(\d+)/i;
 const POS_RE = /X:(-?\d+\.?\d*)\s+Y:(-?\d+\.?\d*)\s+Z:(-?\d+\.?\d*)/;
-
-function lsGet(key) {
-  try {
-    return localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-function lsSet(key, value) {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    /* private mode / quota — settings stay in memory only */
-  }
-}
-
-function readNumber(key, fallback) {
-  const raw = lsGet(key);
-  if (raw === null || raw === "") return fallback;
-  const value = Number.parseFloat(raw);
-  return Number.isFinite(value) ? value : fallback;
-}
-
-function readBool(key, fallback) {
-  const raw = lsGet(key);
-  return raw === null ? fallback : raw === "true";
-}
-
-function readPowerScale() {
-  return lsGet(KEYS.powerScale) === "absolute" ? "absolute" : "relative";
-}
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -69,19 +32,15 @@ function toNumber(value, fallback = Number.NaN) {
 
 export const state = reactive({
   // connection / machine
-  connected: false,
-  connecting: false,
-  disconnecting: false,
-  connectError: "",
+  status: "offline", // offline | connecting | ready | busy | running | disconnecting
   homed: false,
-  busy: false,
+  connectError: "",
   pos: null, // { x, y, z }
   serialSupported: typeof navigator !== "undefined" && Boolean(navigator.serial),
 
   // job
   job: null,
   jobName: "",
-  running: false,
   stopRequested: false,
   progress: { sent: 0, total: 0 },
   currentLine: "",
@@ -92,16 +51,33 @@ export const state = reactive({
   log: [],
 
   // persisted settings
-  focusZ: readNumber(KEYS.focusZ, ""),
-  dotPower: clamp(readNumber(KEYS.dotPower, 50), 0, 1000),
-  dotMs: clamp(readNumber(KEYS.dotMs, 300), 50, 2000),
-  step: readNumber(KEYS.step, 1),
-  dryRun: readBool(KEYS.dryRun, true),
-  overrideS: clamp(readNumber(KEYS.overrideS, 500), 0, 1000),
-  overrideEnabled: readBool(KEYS.overrideEnabled, false),
-  dark: readBool(KEYS.dark, false),
-  powerScale: readPowerScale(), // "relative" (job max S) | "absolute" (S1000)
+  ...loadSettings(),
 });
+
+persistSettings(state);
+
+// --- derived state ----------------------------------------------------------
+
+export const connected = computed(
+  () => state.status !== "offline" && state.status !== "connecting",
+);
+export const running = computed(() => state.status === "running");
+
+/** Manual moves (jog, Z, home) are only allowed when idle and connected. */
+export const canJog = computed(() => state.status === "ready");
+
+export const bboxOutOfBed = computed(() => {
+  const bbox = state.job?.bbox;
+  if (!bbox) return false;
+  return bbox.minX < 0 || bbox.minY < 0 || bbox.maxX > XY_MAX || bbox.maxY > XY_MAX;
+});
+
+export const canRun = computed(
+  () => state.status === "ready" && Boolean(state.job?.lines?.length),
+);
+export const canDots = computed(
+  () => state.status === "ready" && Boolean(state.job?.bbox) && !bboxOutOfBed.value,
+);
 
 /**
  * Effective send-time power override.
@@ -114,80 +90,107 @@ export const effectivePower = computed(() => {
   return clamp(Math.round(toNumber(state.overrideS, 0)), 0, 1000);
 });
 
+export const progressPct = computed(() => {
+  const total = state.progress.total || 0;
+  const sent = state.progress.sent || 0;
+  return total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : 0;
+});
+
+// --- console ----------------------------------------------------------------
+
 // Only warnings and errors get colour; everything else stays neutral.
 function logTone(text) {
   if (text.startsWith("> ")) return "out";
   if (text.startsWith("[gcode]")) return "warn";
-  if (
-    /^(error\b|!!|printer halted|unknown command|kill\(\))/i.test(text) ||
-    /unknown command/i.test(text)
-  ) {
-    return "error";
-  }
+  if (/^(error\b|!!|printer halted|unknown command|kill\(\))/i.test(text)) return "error";
   if (/^(echo:busy\b|resend:|busy\b)/i.test(text)) return "warn";
 
   if (/^\[[a-z]+\]/i.test(text)) {
-    if (/\b(error|failed|abort|timeout|no ok|permission)\b/i.test(text)) return "error";
+    if (/\b(error|failed|abort|timeout|no ok|permission|lost)\b/i.test(text)) return "error";
     if (/\b(warning|warn|stopped|stop requested|busy|resend)\b/i.test(text)) return "warn";
   }
   return "normal";
 }
 
+let logId = 0;
+
 export function pushLog(line) {
   const text = String(line);
-  state.log.push({ text, tone: logTone(text) });
+  state.log.push({ id: ++logId, text, tone: logTone(text) });
   if (state.log.length > 2000) state.log.splice(0, state.log.length - 2000);
 }
+
+// --- errors -----------------------------------------------------------------
+
+function errorMessage(err) {
+  return String(err?.message ?? err);
+}
+
+function reportError(title, err, logTag) {
+  const message = errorMessage(err);
+  if (logTag) pushLog(`[${logTag}] ${message}`);
+  toast({ title, description: message, accent: "danger" });
+}
+
+// --- machine link -----------------------------------------------------------
 
 export const marlin = new Marlin({
   onLog: pushLog,
   onState: (patch) => {
-    if (typeof patch.connected === "boolean") state.connected = patch.connected;
+    if (patch.connected === false) {
+      const unexpected =
+        state.status === "ready" || state.status === "busy" || state.status === "running";
+      state.status = "offline";
+      state.homed = false;
+      state.pos = null;
+      state.stopRequested = false;
+      if (unexpected) {
+        toast({
+          title: "Connection lost",
+          description:
+            "The serial link went down. Check the machine — the laser state cannot be confirmed from here.",
+          accent: "danger",
+        });
+      }
+    }
     if (typeof patch.homed === "boolean") state.homed = patch.homed;
   },
 });
 
-// --- modal confirmation -----------------------------------------------------
-// The App renders one Dialog bound to this state; store actions await it.
-export const confirmState = reactive({
-  open: false,
-  title: "",
-  description: "",
-  lines: [],
-  confirmLabel: "Continue",
-  cancelLabel: "Cancel",
-  accent: null,
-});
+/**
+ * Single-flight busy guard. Nests (ensureHomed → home inside a move) via a
+ * depth counter; never restores over a status that changed meanwhile
+ * (link loss, disconnect).
+ */
+let busyDepth = 0;
 
-let confirmResolve = null;
-
-export function confirmDialog(options = {}) {
-  return new Promise((resolve) => {
-    if (confirmResolve) confirmResolve(false);
-    Object.assign(confirmState, {
-      open: true,
-      title: options.title ?? "Confirm",
-      description: options.description ?? "",
-      lines: options.lines ?? [],
-      confirmLabel: options.confirmLabel ?? "Continue",
-      cancelLabel: options.cancelLabel ?? "Cancel",
-      accent: options.accent ?? null,
-    });
-    confirmResolve = resolve;
-  });
+async function withBusy(fn) {
+  busyDepth++;
+  if (busyDepth === 1) state.status = "busy";
+  try {
+    return await fn();
+  } finally {
+    busyDepth--;
+    if (busyDepth === 0 && state.status === "busy") state.status = "ready";
+  }
 }
 
-export function resolveConfirm(value) {
-  confirmState.open = false;
-  const resolve = confirmResolve;
-  confirmResolve = null;
-  resolve?.(Boolean(value));
+const idleWaiters = new Set();
+
+function whenIdle() {
+  if (state.status !== "running") return Promise.resolve();
+  return new Promise((resolve) => idleWaiters.add(resolve));
+}
+
+function resolveIdle() {
+  for (const resolve of idleWaiters) resolve();
+  idleWaiters.clear();
 }
 
 // --- positions --------------------------------------------------------------
 
 export async function updatePosition() {
-  if (!state.connected) return null;
+  if (!connected.value) return null;
   try {
     const result = await marlin.send("M114");
     const match = (result.response ?? "").match(POS_RE);
@@ -198,21 +201,22 @@ export async function updatePosition() {
     state.pos = { x: Number(match[1]), y: Number(match[2]), z: Number(match[3]) };
     return state.pos;
   } catch (err) {
-    pushLog(`[ctl] position error: ${err?.message ?? err}`);
+    pushLog(`[ctl] position error: ${errorMessage(err)}`);
     return null;
   }
 }
 
 function updateCrosshair(line) {
-  const mx = line.match(/X(-?(?:\d+\.?\d*|\.\d+))/i);
-  const my = line.match(/Y(-?(?:\d+\.?\d*|\.\d+))/i);
-  if (!mx && !my) return;
+  let x = null;
+  let y = null;
+  for (const [, letter, raw] of wordsOf(line)) {
+    const upper = letter.toUpperCase();
+    if (upper === "X") x = Number(raw);
+    else if (upper === "Y") y = Number(raw);
+  }
+  if (x === null && y === null) return;
   const previous = state.pos ?? { x: 0, y: 0, z: 0 };
-  state.pos = {
-    x: mx ? Number(mx[1]) : previous.x,
-    y: my ? Number(my[1]) : previous.y,
-    z: previous.z,
-  };
+  state.pos = { x: x ?? previous.x, y: y ?? previous.y, z: previous.z };
 }
 
 // Any manual move / laser action must be homed first. Returns false even after
@@ -232,12 +236,12 @@ async function ensureHomed() {
 // --- connection -------------------------------------------------------------
 
 export async function connect() {
-  if (state.connected || state.connecting) return;
-  state.connecting = true;
+  if (state.status !== "offline") return;
+  state.status = "connecting";
   state.connectError = "";
   try {
     await marlin.connect();
-    state.connected = true;
+    state.status = "ready";
     state.homed = false;
     state.pos = null;
     toast({
@@ -247,7 +251,8 @@ export async function connect() {
       duration: 3000,
     });
   } catch (err) {
-    const message = String(err?.message ?? err);
+    state.status = "offline";
+    const message = errorMessage(err);
     let description = message;
     if (err?.name === "NotFoundError") description = "No serial port was selected.";
     if (/permission/i.test(message)) {
@@ -256,46 +261,32 @@ export async function connect() {
     state.connectError = description;
     pushLog(`[serial] connect failed: ${message}`);
     toast({ title: "Could not connect", description, accent: "danger" });
-  } finally {
-    state.connecting = false;
   }
 }
 
-let idleResolve = null;
-
-function whenIdle() {
-  if (!state.running) return Promise.resolve();
-  return new Promise((resolve) => {
-    idleResolve = resolve;
-  });
-}
-
 export async function disconnect() {
-  if (!state.connected || state.disconnecting) return;
-  state.disconnecting = true;
+  if (!connected.value || state.status === "disconnecting") return;
   try {
-    if (state.running) {
+    if (state.status === "running") {
       state.stopRequested = true;
       pushLog("[job] stop requested by disconnect");
+      await whenIdle();
     }
-    await whenIdle();
+    state.status = "disconnecting";
     await marlin.disconnect();
   } catch (err) {
-    pushLog(`[serial] disconnect error: ${err?.message ?? err}`);
+    pushLog(`[serial] disconnect error: ${errorMessage(err)}`);
   } finally {
-    state.connected = false;
+    state.status = "offline";
     state.homed = false;
     state.pos = null;
-    state.running = false;
     state.stopRequested = false;
-    state.busy = false;
-    state.disconnecting = false;
   }
 }
 
 export async function laserOffNow() {
-  if (!state.connected) return;
-  if (state.running) {
+  if (!connected.value) return;
+  if (state.status === "running") {
     state.stopRequested = true;
     pushLog("[job] stop requested by laser off");
   }
@@ -306,67 +297,63 @@ export async function laserOffNow() {
 // --- manual controls --------------------------------------------------------
 
 export async function home() {
-  if (!state.connected) return false;
-  const wasBusy = state.busy;
-  state.busy = true;
-  try {
+  if (!connected.value) return false;
+  return withBusy(async () => {
     pushLog("[ctl] homing");
-    const result = await marlin.send("G28", 180000);
-    if (!result.ok) {
-      pushLog(`[ctl] homing failed: ${result.response}`);
-      toast({
-        title: "Homing failed",
-        description: result.response || "No ok from G28.",
-        accent: "danger",
-      });
+    try {
+      const result = await marlin.send("G28", 180000);
+      if (!result.ok) {
+        pushLog(`[ctl] homing failed: ${result.response}`);
+        toast({
+          title: "Homing failed",
+          description: result.response || "No ok from G28.",
+          accent: "danger",
+        });
+        return false;
+      }
+      state.homed = true;
+      if (result.error) {
+        pushLog("[ctl] homing completed with firmware warnings; the command returned ok");
+      }
+      await updatePosition();
+      pushLog("[ctl] homed; Z0 is the bed surface");
+      return true;
+    } catch (err) {
+      reportError("Homing failed", err);
       return false;
     }
-    state.homed = true;
-    if (result.error) {
-      pushLog("[ctl] homing completed with firmware warnings; the command returned ok");
-    }
-    await updatePosition();
-    pushLog("[ctl] homed; Z0 is the bed surface");
-    return true;
-  } catch (err) {
-    toast({ title: "Homing failed", description: String(err?.message ?? err), accent: "danger" });
-    return false;
-  } finally {
-    state.busy = wasBusy;
-  }
+  });
 }
 
 async function moveAxis(axis, delta) {
-  if (!state.connected || state.running) return;
+  if (!connected.value || state.status === "running") return;
   const key = String(axis).toUpperCase();
   if (!["X", "Y", "Z"].includes(key)) return;
   const distance = toNumber(delta, 0);
   if (!Number.isFinite(distance) || distance === 0) return;
 
-  const wasBusy = state.busy;
-  state.busy = true;
-  try {
-    if (!(await ensureHomed())) return;
-    if (!state.pos) await updatePosition();
-    if (!state.pos) {
-      toast({ title: "Position unknown", description: "Home the machine first.", accent: "warn" });
-      return;
+  await withBusy(async () => {
+    try {
+      if (!(await ensureHomed())) return;
+      if (!state.pos) await updatePosition();
+      if (!state.pos) {
+        toast({ title: "Position unknown", description: "Home the machine first.", accent: "warn" });
+        return;
+      }
+      const lower = key.toLowerCase();
+      const limit = key === "Z" ? Z_MAX : XY_MAX;
+      const target = clamp(state.pos[lower] + distance, 0, limit);
+      const result = await marlin.send(`G0 ${key}${target.toFixed(3)}`);
+      if (!result.ok) {
+        pushLog(`[ctl] ${key} move failed: ${result.response}`);
+        toast({ title: `${key} move failed`, description: result.response || "No ok.", accent: "danger" });
+        return;
+      }
+      await updatePosition();
+    } catch (err) {
+      reportError("Move failed", err);
     }
-    const lower = key.toLowerCase();
-    const limit = key === "Z" ? Z_MAX : XY_MAX;
-    const target = clamp(state.pos[lower] + distance, 0, limit);
-    const result = await marlin.send(`G0 ${key}${target.toFixed(3)}`);
-    if (!result.ok) {
-      pushLog(`[ctl] ${key} move failed: ${result.response}`);
-      toast({ title: `${key} move failed`, description: result.response || "No ok.", accent: "danger" });
-      return;
-    }
-    await updatePosition();
-  } catch (err) {
-    toast({ title: "Move failed", description: String(err?.message ?? err), accent: "danger" });
-  } finally {
-    state.busy = wasBusy;
-  }
+  });
 }
 
 export async function jog(axis, direction) {
@@ -379,7 +366,7 @@ export async function nudgeZ(delta) {
 
 /** Move Z to the value entered in the Z panel's input. */
 export async function moveToZ() {
-  if (!state.connected || state.running) return;
+  if (!connected.value || state.status === "running") return;
   const target = toNumber(state.focusZ);
   if (!Number.isFinite(target)) {
     toast({
@@ -390,24 +377,22 @@ export async function moveToZ() {
     return;
   }
 
-  const wasBusy = state.busy;
-  state.busy = true;
-  try {
-    if (!(await ensureHomed())) return;
-    const clamped = clamp(target, 0, Z_MAX);
-    const result = await marlin.send(`G0 Z${clamped.toFixed(3)}`);
-    if (!result.ok) {
-      pushLog(`[ctl] Z move failed: ${result.response}`);
-      toast({ title: "Z move failed", description: result.response || "No ok.", accent: "danger" });
-      return;
+  await withBusy(async () => {
+    try {
+      if (!(await ensureHomed())) return;
+      const clamped = clamp(target, 0, Z_MAX);
+      const result = await marlin.send(`G0 Z${clamped.toFixed(3)}`);
+      if (!result.ok) {
+        pushLog(`[ctl] Z move failed: ${result.response}`);
+        toast({ title: "Z move failed", description: result.response || "No ok.", accent: "danger" });
+        return;
+      }
+      await updatePosition();
+      pushLog(`[ctl] moved to Z ${clamped.toFixed(2)} mm`);
+    } catch (err) {
+      reportError("Z move failed", err);
     }
-    await updatePosition();
-    pushLog(`[ctl] moved to Z ${clamped.toFixed(2)} mm`);
-  } catch (err) {
-    toast({ title: "Z move failed", description: String(err?.message ?? err), accent: "danger" });
-  } finally {
-    state.busy = wasBusy;
-  }
+  });
 }
 
 // --- job --------------------------------------------------------------------
@@ -435,97 +420,84 @@ export async function loadFile(file) {
       duration: 2500,
     });
   } catch (err) {
-    toast({ title: "Could not read the file", description: String(err?.message ?? err), accent: "danger" });
+    reportError("Could not read the file", err);
   }
 }
 
 export async function markCorners() {
-  if (!state.connected || !state.job?.bbox || state.running) return;
+  if (!canDots.value) return;
   const job = state.job;
   const bbox = job.bbox;
-  if (bbox.minX < 0 || bbox.minY < 0 || bbox.maxX > XY_MAX || bbox.maxY > XY_MAX) {
-    toast({
-      title: "Bounding box is outside the bed",
-      description: "Move or rescale the job before marking corners.",
-      accent: "danger",
-    });
-    return;
-  }
 
-  const wasBusy = state.busy;
-  state.busy = true;
-  try {
-    if (!(await ensureHomed())) return;
-    if (!state.connected || state.job !== job) return;
+  await withBusy(async () => {
+    try {
+      if (!(await ensureHomed())) return;
+      if (!connected.value || state.job !== job) return;
 
-    const power = clamp(Math.round(toNumber(state.dotPower, 50)), 0, 1000);
-    const ms = clamp(Math.round(toNumber(state.dotMs, 300)), 50, 2000);
-    const corners = [
-      [bbox.minX, bbox.minY],
-      [bbox.maxX, bbox.minY],
-      [bbox.maxX, bbox.maxY],
-      [bbox.minX, bbox.maxY],
-    ];
-
-    if (power > 0) {
-      const confirmed = await confirmDialog({
-        title: "Fire alignment dots",
-        description:
-          "Four short pulses mark the job corners. Wear 450 nm glasses and put material under the beam.",
-        lines: [
-          `Power S${power} · ${ms} ms`,
-          ...corners.map(([x, y], index) => `Corner ${index + 1}: X${x.toFixed(2)} Y${y.toFixed(2)}`),
-        ],
-        confirmLabel: "Fire dots",
-        accent: "danger",
-      });
-      if (!confirmed || !state.connected || state.job !== job) return;
-    }
-
-    pushLog(
-      power > 0
-        ? `[dots] firing S${power} for ${ms} ms at each corner`
-        : "[dots] dry corner visits (laser off)",
-    );
-
-    for (const [x, y] of corners) {
-      const move = await marlin.send(`G0 X${x.toFixed(3)} Y${y.toFixed(3)}`);
-      if (!move.ok) throw new Error(`move failed: ${move.response}`);
+      const power = clamp(Math.round(toNumber(state.dotPower, 50)), 0, 1000);
+      const ms = clamp(Math.round(toNumber(state.dotMs, 300)), 50, 2000);
+      const corners = [
+        [bbox.minX, bbox.minY],
+        [bbox.maxX, bbox.minY],
+        [bbox.maxX, bbox.maxY],
+        [bbox.minX, bbox.maxY],
+      ];
 
       if (power > 0) {
-        const on = await marlin.send(`M3 S${power}`);
-        if (!on.ok) throw new Error(`laser on failed: ${on.response}`);
-        await marlin.send(`G4 P${ms}`);
-        await marlin.send("M5");
-        pushLog(`[dots] fired X${x.toFixed(2)} Y${y.toFixed(2)}`);
-      } else {
-        await marlin.send("G4 P500");
-        pushLog(`[dots] dry visit X${x.toFixed(2)} Y${y.toFixed(2)}`);
+        const confirmed = await confirmDialog({
+          title: "Fire alignment dots",
+          description:
+            "Four short pulses mark the job corners. Wear 450 nm glasses and put material under the beam.",
+          lines: [
+            `Power S${power} · ${ms} ms`,
+            ...corners.map(([x, y], index) => `Corner ${index + 1}: X${x.toFixed(2)} Y${y.toFixed(2)}`),
+          ],
+          confirmLabel: "Fire dots",
+          accent: "danger",
+        });
+        if (!confirmed || !connected.value || state.job !== job) return;
       }
-    }
 
-    await updatePosition();
-    pushLog(power > 0 ? "[dots] all corners fired" : "[dots] all corners visited");
-  } catch (err) {
-    pushLog(`[dots] error: ${err?.message ?? err}`);
-    toast({ title: "Corner dots failed", description: String(err?.message ?? err), accent: "danger" });
-  } finally {
-    await marlin.laserOff();
-    state.busy = wasBusy;
-  }
+      pushLog(
+        power > 0
+          ? `[dots] firing S${power} for ${ms} ms at each corner`
+          : "[dots] dry corner visits (laser off)",
+      );
+
+      for (const [x, y] of corners) {
+        const move = await marlin.send(`G0 X${x.toFixed(3)} Y${y.toFixed(3)}`);
+        if (!move.ok) throw new Error(`move failed: ${move.response}`);
+
+        if (power > 0) {
+          const on = await marlin.send(`M3 S${power}`);
+          if (!on.ok) throw new Error(`laser on failed: ${on.response}`);
+          await marlin.send(`G4 P${ms}`);
+          await marlin.send("M5");
+          pushLog(`[dots] fired X${x.toFixed(2)} Y${y.toFixed(2)}`);
+        } else {
+          await marlin.send("G4 P500");
+          pushLog(`[dots] dry visit X${x.toFixed(2)} Y${y.toFixed(2)}`);
+        }
+      }
+
+      await updatePosition();
+      pushLog(power > 0 ? "[dots] all corners fired" : "[dots] all corners visited");
+    } catch (err) {
+      reportError("Corner dots failed", err, "dots");
+    } finally {
+      await marlin.laserOff();
+    }
+  });
 }
 
 export async function runJob() {
-  if (!state.connected || !state.job?.lines?.length || state.running) return;
+  if (!canRun.value) return;
   if (!(await ensureHomed())) return;
 
   const job = state.job;
-  if (!job?.lines?.length || !state.connected || state.running) return;
+  if (!canRun.value || state.job !== job) return;
   const lines = job.lines;
-  const firstFire = lines.find((line) => {
-    const match = LASER_ON_RE.exec(line);
-    return match && Number(match[2]) > 0;
-  });
+  const firstFire = lines.find((line) => (firingPower(line) ?? 0) > 0);
   const override = effectivePower.value;
   const isDryRun = override === 0;
 
@@ -550,9 +522,9 @@ export async function runJob() {
     confirmLabel: isDryRun ? "Start dry run" : "Fire",
     accent: isDryRun ? null : "danger",
   });
-  if (!confirmed || state.running || !state.connected || state.job !== job) return;
+  if (!confirmed || !canRun.value || state.job !== job) return;
 
-  state.running = true;
+  state.status = "running";
   state.stopRequested = false;
   state.lastStatus = "running";
   state.progress = { sent: 0, total: lines.length };
@@ -617,53 +589,26 @@ export async function runJob() {
     }
   } catch (err) {
     state.lastStatus = "error";
-    pushLog(`[job] error: ${err?.message ?? err}`);
-    toast({ title: "Job error", description: String(err?.message ?? err), accent: "danger" });
+    reportError("Job error", err, "job");
   } finally {
     await marlin.laserOff();
-    state.running = false;
+    if (state.status === "running") state.status = "ready";
     state.stopRequested = false;
     await updatePosition();
-    idleResolve?.();
-    idleResolve = null;
+    resolveIdle();
     pushLog(`[job] finished: ${state.lastStatus}`);
   }
 }
 
 export function stopJob() {
-  if (!state.running) return;
+  if (state.status !== "running") return;
   state.stopRequested = true;
   pushLog("[job] stop requested; waiting for the in-flight line");
 }
-
-// --- derived state ----------------------------------------------------------
-
-export const progressPct = computed(() => {
-  const total = state.progress.total || 0;
-  const sent = state.progress.sent || 0;
-  return total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : 0;
-});
 
 // --- theme ------------------------------------------------------------------
 
 export function toggleDark() {
   state.dark = !state.dark;
   document.documentElement.classList.toggle("dark", state.dark);
-  lsSet(KEYS.dark, String(state.dark));
 }
-
-// --- persistence ------------------------------------------------------------
-
-watch(
-  () => state.focusZ,
-  (value) => lsSet(KEYS.focusZ, value === null || value === undefined ? "" : String(value)),
-);
-watch(() => state.dotPower, (value) => lsSet(KEYS.dotPower, String(value ?? "")));
-watch(() => state.dotMs, (value) => lsSet(KEYS.dotMs, String(value ?? "")));
-watch(() => state.step, (value) => lsSet(KEYS.step, String(value ?? "")));
-watch(() => state.dryRun, (value) => lsSet(KEYS.dryRun, String(Boolean(value))));
-watch(() => state.overrideS, (value) => lsSet(KEYS.overrideS, String(value ?? "")));
-watch(() => state.overrideEnabled, (value) =>
-  lsSet(KEYS.overrideEnabled, String(Boolean(value))),
-);
-watch(() => state.powerScale, (value) => lsSet(KEYS.powerScale, String(value)));

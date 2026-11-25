@@ -1,12 +1,30 @@
 // Web Serial link for the Creality Ender 3 S1 / Marlin laser.
 // One in-flight command at a time; resolves on the line-anchored "ok".
+//
+// Safety properties:
+// - A yanked cable or dead read loop fails the pending command immediately
+//   and reports the link as down (no 30 s timeout cascade, no fake "Connected").
+// - After a command timeout the link is marked desynced: late "ok" lines are
+//   drained until input is quiet before the next command is sent, so a stale
+//   ok can never resolve the wrong command.
+// - The port picker is always shown; a previously granted port is never
+//   opened silently (it might be a different device).
+//
+// The `serial` constructor option is a test seam: anything shaped like
+// navigator.serial (requestPort → port with open/close/setSignals/readable/
+// writable/disconnect events) can drive the class under plain Node.
 
 export const BAUD = 115200;
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export class Marlin {
-  constructor({ onLog = () => {}, onState = () => {} } = {}) {
+  constructor({ onLog = () => {}, onState = () => {}, serial, timing = {} } = {}) {
     this.onLog = onLog;
     this.onState = onState;
+    this.serial =
+      serial ?? (typeof navigator !== "undefined" ? navigator.serial ?? null : null);
+    this.timing = { bannerMs: 3000, quietMs: 250, resyncMaxMs: 3000, ...timing };
     this.port = null;
     this.reader = null;
     this.writer = null;
@@ -16,7 +34,11 @@ export class Marlin {
     this.buffer = "";
     this.pending = null;
     this.queue = Promise.resolve();
+    this.bannerResolve = null;
+    this.desynced = false;
+    this.lastLineAt = 0;
     this._connected = false;
+    this.onPortDisconnect = () => this.handleLinkLoss("device unplugged");
   }
 
   get connected() {
@@ -25,18 +47,21 @@ export class Marlin {
 
   async connect() {
     if (this._connected) return;
-    if (!navigator.serial) {
+    if (!this.serial) {
       throw new Error(
         "Web Serial is not available. Use Chromium or Firefox 151+ on desktop, over localhost or https.",
       );
     }
 
-    const ports = await navigator.serial.getPorts();
-    const port = ports[0] ?? (await navigator.serial.requestPort());
+    // Always ask: auto-opening ports[0] could silently target another device.
+    const port = await this.serial.requestPort();
     await port.open({ baudRate: BAUD });
 
     this.port = port;
     this._connected = true;
+    this.buffer = "";
+    this.decoder = new TextDecoder("utf-8", { stream: true });
+    port.addEventListener("disconnect", this.onPortDisconnect);
 
     try {
       await port.setSignals({ dataTerminalReady: false, requestToSend: false });
@@ -44,15 +69,31 @@ export class Marlin {
       /* optional; some bridges do not support it */
     }
 
+    // Opening the port resets the board. Wait for the "start" banner instead
+    // of a fixed sleep; fall back to a timeout for firmware that stays quiet.
+    const banner = this.waitForBanner();
     this.startReadLoop();
-
-    // Opening the port resets the board. Wait for the banner, then drain it.
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    this.buffer = "";
     this.onLog("[serial] board reset; waiting for banner");
+    await banner;
+    if (!this._connected) {
+      throw new Error("Serial link lost while waiting for the board banner.");
+    }
+    this.buffer = "";
 
     await this.send("M5", 5000).catch(() => {});
     this.onState({ connected: true, homed: false });
+  }
+
+  waitForBanner() {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.bannerResolve = null;
+        resolve();
+      };
+      const timer = setTimeout(done, this.timing.bannerMs);
+      this.bannerResolve = done;
+    });
   }
 
   startReadLoop() {
@@ -67,7 +108,7 @@ export class Marlin {
           this.flushLines();
         }
       } catch (err) {
-        if (this._connected) this.onLog(`[serial] read error: ${err?.message ?? err}`);
+        if (this._connected) this.handleLinkLoss(`read error: ${err?.message ?? err}`);
       } finally {
         try {
           this.reader?.releaseLock();
@@ -75,6 +116,10 @@ export class Marlin {
           /* already released */
         }
         this.reader = null;
+        // A closed stream while we still believe we are connected is a link
+        // loss too (reader.cancel() during disconnect() runs after the flag
+        // is cleared, so it never lands here).
+        if (this._connected) this.handleLinkLoss("read stream closed");
       }
     })();
   }
@@ -91,7 +136,10 @@ export class Marlin {
   handleLine(line) {
     const trimmed = line.trim();
     if (!trimmed) return;
+    this.lastLineAt = Date.now();
     this.onLog(trimmed);
+
+    if (/^start\b/i.test(trimmed)) this.bannerResolve?.();
 
     const pending = this.pending;
     if (!pending) return;
@@ -128,8 +176,55 @@ export class Marlin {
     }
   }
 
+  /** Resolve the in-flight command as a failure without waiting for ok. */
+  failPending(reason) {
+    const pending = this.pending;
+    if (!pending) return;
+    this.pending = null;
+    pending.resolve({
+      ok: false,
+      error: true,
+      response: pending.lines.length
+        ? `${pending.lines.join("\n")}\n(${reason})`
+        : reason,
+    });
+  }
+
+  handleLinkLoss(reason) {
+    if (!this._connected) return;
+    this._connected = false;
+    this.desynced = false;
+    this.onLog(`[serial] link lost: ${reason}`);
+    this.bannerResolve?.();
+    this.failPending(`link lost: ${reason}`);
+    this.onState({ connected: false, homed: false });
+    this.closeTransport().catch(() => {});
+  }
+
+  /**
+   * After a timeout, the firmware may still emit the command's ok later.
+   * Drain input until it has been quiet for a moment so that stale ok cannot
+   * resolve the next command early.
+   */
+  async drainUntilQuiet() {
+    this.onLog("[serial] resync: draining late responses after a timeout");
+    this.pending = null;
+    this.lastLineAt = Date.now();
+    const deadline = Date.now() + this.timing.resyncMaxMs;
+    while (this._connected && Date.now() < deadline) {
+      await sleep(25);
+      if (!this.buffer && Date.now() - this.lastLineAt >= this.timing.quietMs) break;
+    }
+    this.buffer = "";
+    this.desynced = false;
+  }
+
   send(line, timeoutMs = 30000) {
     const run = async () => {
+      if (!this._connected || !this.port) {
+        throw new Error("Not connected");
+      }
+      if (this.desynced) await this.drainUntilQuiet();
       if (!this._connected || !this.port) {
         throw new Error("Not connected");
       }
@@ -143,6 +238,7 @@ export class Marlin {
         const pending = { lines: [], error: false, resolve };
         const timer = setTimeout(() => {
           if (this.pending === pending) this.pending = null;
+          this.desynced = true;
           const response = pending.lines.length
             ? `${pending.lines.join("\n")}\n(timeout)`
             : "timeout";
@@ -182,18 +278,9 @@ export class Marlin {
     }
   }
 
-  async disconnect() {
-    if (!this._connected) return;
-
-    // M5 must go out before the port closes; firmware latches laser state.
-    try {
-      await this.laserOff();
-    } catch {
-      /* best effort */
-    }
-
-    this._connected = false;
-    this.onState({ connected: false });
+  async closeTransport() {
+    const port = this.port;
+    if (port) port.removeEventListener("disconnect", this.onPortDisconnect);
 
     try {
       await this.reader?.cancel();
@@ -220,11 +307,30 @@ export class Marlin {
     this.writer = null;
 
     try {
-      await this.port?.close();
+      await port?.close();
     } catch {
       /* already closed */
     }
     this.port = null;
+  }
+
+  async disconnect() {
+    if (!this._connected) return;
+
+    // M5 must go out before the port closes; firmware latches laser state.
+    try {
+      await this.laserOff();
+    } catch {
+      /* best effort */
+    }
+
+    this._connected = false;
+    // Anything still in flight (e.g. a move that never answered) must not
+    // hang its caller once the port is going away.
+    this.failPending("port closed");
+    this.onState({ connected: false });
+
+    await this.closeTransport();
     this.onState({ connected: false, homed: false });
   }
 }

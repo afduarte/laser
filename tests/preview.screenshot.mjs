@@ -15,7 +15,7 @@ import { createServer } from "vite";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
-const gcodeDir = path.resolve(here, "../../../laser cutter/gcode");
+const gcodeDir = path.join(here, "fixtures");
 const outDir = path.join(here, "screenshots");
 const PORT = 5199;
 

@@ -1,18 +1,21 @@
-// Canvas cannot consume Reclaim's computed color forms directly:
-// var(--rc-*) resolves to color(srgb ...) / oklab(...), and canvas parsers
-// reject those. Resolve every token to plain rgba() at the read boundary.
-// The probe MUST live on document.body (AGENTS.md rule 5).
+// Canvas color resolution for Reclaim tokens. var(--rc-*) can compute to
+// color(srgb ...) / oklab(...) forms; older canvas parsers reject those, so
+// every token is resolved to plain rgba() at the read boundary, with a 1×1
+// canvas readback as the fallback for forms the regex does not know.
+// The probe MUST live on document.body (AGENTS.md rule 5); both the probe
+// and the readback canvas are created lazily on first use.
 
-const probe = document.createElement("div");
-probe.style.display = "none";
-document.body.appendChild(probe);
-
-const canvas = document.createElement("canvas");
-canvas.width = 1;
-canvas.height = 1;
-const ctx = canvas.getContext("2d", { willReadFrequently: true });
+let probe = null;
+let readbackCtx = null;
 
 const cache = new Map();
+
+function ensureProbe() {
+  if (probe) return;
+  probe = document.createElement("div");
+  probe.style.display = "none";
+  document.body.appendChild(probe);
+}
 
 function parseCssColor(value) {
   const rgb = value.match(
@@ -43,10 +46,16 @@ function parseCssColor(value) {
 }
 
 function readFromCanvas(value) {
-  ctx.clearRect(0, 0, 1, 1);
-  ctx.fillStyle = value;
-  ctx.fillRect(0, 0, 1, 1);
-  const data = ctx.getImageData(0, 0, 1, 1).data;
+  if (!readbackCtx) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 1;
+    canvas.height = 1;
+    readbackCtx = canvas.getContext("2d", { willReadFrequently: true });
+  }
+  readbackCtx.clearRect(0, 0, 1, 1);
+  readbackCtx.fillStyle = value;
+  readbackCtx.fillRect(0, 0, 1, 1);
+  const data = readbackCtx.getImageData(0, 0, 1, 1).data;
   return [data[0], data[1], data[2], data[3] / 255];
 }
 
@@ -59,6 +68,7 @@ export function tokenColor(name, alpha = 1) {
   const key = `${name}|${alpha}`;
   if (cache.has(key)) return cache.get(key);
 
+  ensureProbe();
   probe.style.color = `var(${name})`;
   const computed = getComputedStyle(probe).color;
 
@@ -83,7 +93,6 @@ export function palette() {
   return {
     bed: tokenColor("--rc-surface"),
     grid: tokenColor("--rc-line"),
-    travel: tokenColor("--rc-ink-faint"),
     bbox: tokenColor("--rc-warn"),
     corners: tokenColor("--rc-warn"),
     crosshair: tokenColor("--rc-success"),

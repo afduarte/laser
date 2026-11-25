@@ -1,132 +1,32 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import {
-  Alert,
-  Badge,
-  Button,
-  Checkbox,
-  Dialog,
-  Input,
-  Progress,
-  Select,
-  Separator,
-  Switch,
-  Toaster,
-} from "@reclaim/ui";
+import { Alert, Badge, Button, Checkbox, Dialog, Select, Separator, Toaster } from "@reclaim/ui";
 
 import BedPreview from "./components/BedPreview.vue";
+import DotsPanel from "./components/DotsPanel.vue";
+import JogPanel from "./components/JogPanel.vue";
 import LogPane from "./components/LogPane.vue";
+import RunPanel from "./components/RunPanel.vue";
+import ZPanel from "./components/ZPanel.vue";
+import { confirmState, resolveConfirm } from "./lib/confirm.js";
 import {
-  XY_MAX,
-  Z_MAX,
-  confirmState,
   connect,
+  connected,
   disconnect,
-  effectivePower,
-  home,
-  jog,
   laserOffNow,
   loadFile,
-  markCorners,
   marlin,
-  moveToZ,
-  nudgeZ,
-  progressPct,
-  resolveConfirm,
-  runJob,
+  running,
   state,
-  stopJob,
   toggleDark,
 } from "./lib/store.js";
 
 const fileInput = ref(null);
 
-const stepOptions = [
-  { value: "0.1", label: "0.1 mm" },
-  { value: "1", label: "1 mm" },
-  { value: "10", label: "10 mm" },
-];
-
 const powerScaleOptions = [
   { value: "relative", label: "Relative (job max)" },
   { value: "absolute", label: "Absolute (S1000)" },
 ];
-
-const zOffsets = [-100, -10, -1, 0, 1, 10, 100];
-
-function zButtonText(offset) {
-  return offset > 0 ? `+${offset}` : String(offset);
-}
-
-function zButtonLabel(offset) {
-  if (offset === 0) return "Move Z to the entered value";
-  return `Move Z ${offset > 0 ? "up" : "down"} ${Math.abs(offset)} mm`;
-}
-
-const stepModel = computed({
-  get: () => String(state.step),
-  set: (value) => {
-    state.step = Number(value);
-  },
-});
-
-const manualDisabled = computed(
-  () =>
-    !state.connected ||
-    state.connecting ||
-    state.running ||
-    state.busy ||
-    state.disconnecting,
-);
-
-const runDisabled = computed(
-  () =>
-    !state.connected ||
-    state.connecting ||
-    !state.job?.lines?.length ||
-    state.busy ||
-    state.disconnecting,
-);
-
-const bboxOutOfBed = computed(() => {
-  const bbox = state.job?.bbox;
-  if (!bbox) return false;
-  return bbox.minX < 0 || bbox.minY < 0 || bbox.maxX > XY_MAX || bbox.maxY > XY_MAX;
-});
-
-const dotsDisabled = computed(
-  () =>
-    !state.connected ||
-    state.connecting ||
-    !state.job?.bbox ||
-    bboxOutOfBed.value ||
-    state.running ||
-    state.busy ||
-    state.disconnecting,
-);
-
-const dotPowerNum = computed(() => {
-  const value = Number(state.dotPower);
-  return Number.isFinite(value) ? value : 0;
-});
-
-const positionLabel = computed(() => {
-  if (!state.connected) return "offline";
-  if (!state.pos) return "position unknown";
-  return `X: ${state.pos.x.toFixed(2)}  Y: ${state.pos.y.toFixed(2)}  Z: ${state.pos.z.toFixed(2)}`;
-});
-
-const currentZLabel = computed(() => {
-  if (!state.connected) return "offline";
-  if (!state.pos) return "unknown";
-  return `${state.pos.z.toFixed(2)} mm`;
-});
-
-const effectivePowerLabel = computed(() => {
-  if (state.dryRun) return "S0 (dry run)";
-  if (!state.overrideEnabled) return "From job";
-  return `S${effectivePower.value} override`;
-});
 
 const jobBbox = computed(() => {
   const bbox = state.job?.bbox;
@@ -137,18 +37,10 @@ const jobBbox = computed(() => {
 });
 
 const connectionBadge = computed(() => {
-  if (state.connecting) return { label: "Connecting", accent: "warn" };
-  if (state.disconnecting) return { label: "Disconnecting", accent: "warn" };
-  if (state.connected) return { label: "Connected", accent: "success" };
+  if (state.status === "connecting") return { label: "Connecting", accent: "warn" };
+  if (state.status === "disconnecting") return { label: "Disconnecting", accent: "warn" };
+  if (connected.value) return { label: "Connected", accent: "success" };
   return { label: "Disconnected", accent: null };
-});
-
-const statusBadge = computed(() => {
-  if (state.running) return { label: "Running", accent: "brand" };
-  if (state.lastStatus === "complete") return { label: "Complete", accent: "success" };
-  if (state.lastStatus === "stopped") return { label: "Stopped", accent: "warn" };
-  if (state.lastStatus === "error") return { label: "Error", accent: "danger" };
-  return null;
 });
 
 function openFile() {
@@ -191,13 +83,13 @@ onBeforeUnmount(() => {
         <Badge :accent="connectionBadge.accent" variant="outline">
           {{ connectionBadge.label }}
         </Badge>
-        <Badge v-if="state.connected && !state.homed" accent="warn">Not homed</Badge>
-        <Badge v-if="state.running" accent="brand">Running</Badge>
+        <Badge v-if="connected && !state.homed" accent="warn">Not homed</Badge>
+        <Badge v-if="running" accent="brand">Running</Badge>
       </div>
 
       <div class="ml-auto flex flex-wrap items-center gap-2">
         <Button
-          v-if="state.connected"
+          v-if="connected"
           variant="outline"
           accent="danger"
           size="sm"
@@ -205,23 +97,23 @@ onBeforeUnmount(() => {
         >Laser off</Button>
 
         <Button
-          v-if="state.connected"
+          v-if="connected"
           variant="outline"
           size="sm"
-          :loading="state.disconnecting"
+          :loading="state.status === 'disconnecting'"
           @click="disconnect"
         >Disconnect</Button>
         <Button
           v-else
           size="sm"
-          :loading="state.connecting"
+          :loading="state.status === 'connecting'"
           @click="connect"
         >Connect</Button>
 
         <Button
           variant="outline"
           size="sm"
-          :disabled="state.running"
+          :disabled="running"
           @click="openFile"
         >Open G-code</Button>
 
@@ -274,208 +166,15 @@ onBeforeUnmount(() => {
         </main>
 
         <aside class="flex w-full shrink-0 flex-col gap-5 xl:w-[380px]">
-          <section class="flex flex-col gap-3">
-            <div class="flex items-baseline justify-between gap-3">
-              <h2 class="text-sm font-medium">Jog</h2>
-              <span class="font-mono text-xs text-ink-muted">{{ positionLabel }}</span>
-            </div>
-
-            <div class="flex items-end gap-2">
-              <div class="w-28">
-                <Select v-model="stepModel" :options="stepOptions" label="Step" size="sm" />
-              </div>
-              <Button variant="outline" size="sm" :disabled="manualDisabled" @click="home">
-                Home
-              </Button>
-            </div>
-
-            <div class="flex items-center justify-center gap-6">
-              <div class="grid grid-cols-3 gap-1">
-                <span></span>
-                <Button
-                  variant="outline"
-                  icon
-                  aria-label="Jog Y positive"
-                  :disabled="manualDisabled"
-                  @click="jog('Y', 1)"
-                >↑</Button>
-                <span></span>
-
-                <Button
-                  variant="outline"
-                  icon
-                  aria-label="Jog X negative"
-                  :disabled="manualDisabled"
-                  @click="jog('X', -1)"
-                >←</Button>
-                <span class="self-center text-center font-mono text-xs uppercase tracking-widest text-ink-faint">XY</span>
-                <Button
-                  variant="outline"
-                  icon
-                  aria-label="Jog X positive"
-                  :disabled="manualDisabled"
-                  @click="jog('X', 1)"
-                >→</Button>
-
-                <span></span>
-                <Button
-                  variant="outline"
-                  icon
-                  aria-label="Jog Y negative"
-                  :disabled="manualDisabled"
-                  @click="jog('Y', -1)"
-                >↓</Button>
-                <span></span>
-              </div>
-            </div>
-          </section>
-
+          <JogPanel />
           <Separator />
-
-          <section class="flex flex-col gap-3">
-            <h2 class="text-sm font-medium">Z</h2>
-
-            <div class="flex items-start gap-3">
-              <div class="flex flex-1 flex-col gap-2">
-                <Input
-                  v-model="state.focusZ"
-                  type="number"
-                  min="0"
-                  :max="Z_MAX"
-                  step="0.1"
-                  mono
-                  label="Z (mm)"
-                />
-
-                <div class="flex items-baseline justify-between text-xs">
-                  <span class="text-ink-muted">Current Z</span>
-                  <span class="font-mono text-ink-muted">{{ currentZLabel }}</span>
-                </div>
-
-                <p class="text-xs text-ink-muted">0 moves to the entered Z value.</p>
-              </div>
-
-              <div class="flex w-28 shrink-0 flex-col gap-1">
-                <Button
-                  v-for="offset in zOffsets"
-                  :key="offset"
-                  variant="outline"
-                  size="sm"
-                  :disabled="manualDisabled"
-                  :aria-label="zButtonLabel(offset)"
-                  :title="zButtonLabel(offset)"
-                  @click="offset === 0 ? moveToZ() : nudgeZ(offset)"
-                >{{ zButtonText(offset) }}</Button>
-              </div>
-            </div>
-          </section>
-
+          <ZPanel />
           <Separator />
-
-          <section class="flex flex-col gap-3">
-            <h2 class="text-sm font-medium">Corner dots</h2>
-            <p class="text-xs text-ink-muted">
-              Visits the job bounding-box corners. S0 marks nothing; a higher value fires a
-              short pulse.
-            </p>
-
-            <div class="grid grid-cols-2 gap-2">
-              <Input
-                v-model="state.dotPower"
-                type="number"
-                min="0"
-                max="1000"
-                step="1"
-                mono
-                label="Power (S)"
-              />
-              <Input
-                v-model="state.dotMs"
-                type="number"
-                min="50"
-                max="2000"
-                step="10"
-                mono
-                label="Time (ms)"
-              />
-            </div>
-
-            <Alert v-if="bboxOutOfBed" accent="danger" title="Outside the bed">
-              The firing bounding box extends past the 0–220 mm travel. Move or rescale the job
-              before marking corners.
-            </Alert>
-
-            <div class="flex items-center gap-2">
-              <span v-if="!state.job" class="text-xs text-ink-muted">Load a job first.</span>
-              <span v-else-if="!state.job.bbox" class="text-xs text-ink-muted">
-                This job has no firing bbox.
-              </span>
-
-              <Button
-                variant="outline"
-                :accent="dotPowerNum > 0 ? 'danger' : null"
-                size="sm"
-                class="ml-auto"
-                :disabled="dotsDisabled"
-                @click="markCorners"
-              >Mark corners</Button>
-            </div>
-          </section>
+          <DotsPanel />
 
           <template v-if="state.job">
             <Separator />
-
-            <section class="flex flex-col gap-3">
-              <div class="flex items-center justify-between gap-2">
-                <h2 class="text-sm font-medium">Run</h2>
-                <Badge v-if="statusBadge" :accent="statusBadge.accent" variant="outline">
-                  {{ statusBadge.label }}
-                </Badge>
-              </div>
-
-              <div class="flex items-end gap-3">
-                <div class="w-28">
-                  <Input
-                    v-model="state.overrideS"
-                    type="number"
-                    min="0"
-                    max="1000"
-                    step="1"
-                    mono
-                    label="Override S"
-                    :disabled="!state.overrideEnabled || state.running"
-                  />
-                </div>
-                <Switch
-                  v-model="state.overrideEnabled"
-                  label="Apply override"
-                  :disabled="state.running"
-                />
-              </div>
-
-              <div class="flex items-center justify-between gap-2">
-                <Switch v-model="state.dryRun" label="Dry run (S0)" :disabled="state.running" />
-                <span class="font-mono text-xs text-ink-muted">{{ effectivePowerLabel }}</span>
-              </div>
-
-              <p class="text-xs text-ink-muted">
-                Rewrites nonzero S at send time; S0 stays S0.
-              </p>
-
-              <Progress :model-value="progressPct" label="Job progress" />
-
-              <div class="flex items-end justify-between gap-3">
-                <div class="min-w-0 flex-1 font-mono text-xs text-ink-muted">
-                  <p>{{ state.progress.sent }}/{{ state.progress.total }} lines</p>
-                  <p class="truncate" :title="state.currentLine">{{ state.currentLine || "—" }}</p>
-                </div>
-
-                <Button v-if="!state.running" :disabled="runDisabled" @click="runJob">
-                  Run job
-                </Button>
-                <Button v-else accent="danger" @click="stopJob">Stop</Button>
-              </div>
-            </section>
+            <RunPanel />
           </template>
 
           <Separator />

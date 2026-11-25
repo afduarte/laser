@@ -33,11 +33,16 @@ immediately. Bare dependencies (`vue`, `reka-ui`, `clsx`, `tailwind-merge`) come
 this app's `node_modules`.
 
 ```sh
-npm test           # pure G-code parser tests (no browser, no hardware)
+npm test           # parser + serial protocol + settings tests (plain Node, no browser, no hardware)
 npm run test:shots # preview screenshots via cached Playwright Chromium (no hardware)
 npm run build      # production build into dist/
 npm run preview
 ```
+
+The unit tests run on `node --test` with fixtures vendored in `tests/fixtures/`,
+so the suite is self-contained. The Marlin protocol tests drive the real class
+through a fake Web Serial port (streams + events), covering ok-wait ordering,
+timeout resync, hard faults, and cable-yank handling.
 
 `test:shots` starts its own Vite server, loads the sample grids through the file
 input, and writes light/dark × relative/absolute preview captures to
@@ -53,9 +58,13 @@ subpath (for example `https://user.github.io/repo/laser/`). Upload the contents 
 
 ## Using the panel
 
-1. **Connect** opens the browser's serial-port picker (the CH340 device). Opening the
-   port resets the board, so the app waits for the banner, drains it, and treats the
-   position as **not homed**.
+1. **Connect** opens the browser's serial-port picker (the CH340 device) every
+   time — a previously granted port is never opened silently, since it might be
+   a different device. Opening the port resets the board, so the app waits for
+   the firmware banner, drains it, and treats the position as **not homed**.
+   If the USB link drops mid-session, the pending command fails immediately,
+   the panel shows *Disconnected*, and a toast warns that the laser state
+   cannot be confirmed — check the machine.
 2. **Home** runs `G28` (CRTouch gives `Z0 = bed`).
 3. **Load** a Lasertools `.ngc` with **Open G-code**. The preview shows burn paths,
    optional travel moves, the firing bounding box, corner markers, and the live head
@@ -90,6 +99,9 @@ enter the Z target once in the GUI.
   the stream breaks. The printer's physical switch is the real E-stop.
 - Stop the job before closing the tab. The `pagehide` handler makes a best-effort `M5`,
   but an unload cannot be awaited.
+- A dropped USB link fails the job immediately and shows *Disconnected*, but the app
+  cannot confirm the laser state afterwards. Treat the machine as potentially live
+  until you have checked it.
 - Use a sacrificial, non-reflective plate under the work (matte ceramic, anodized
   aluminium, slate). Do not fire directly on the PEI sheet.
 - Keep a spray bottle or CO₂ extinguisher within reach and ventilate paint/fume work.
@@ -105,17 +117,26 @@ laser/
 ├── src/
 │   ├── main.js             # theme/fonts, dark mode bootstrap, mount
 │   ├── app.css             # Reclaim Tailwind bridge + component source scan
-│   ├── App.vue             # shell, sidebar sections, dialogs, file input
+│   ├── App.vue             # shell: header, preview, dialogs, file input
 │   ├── components/
 │   │   ├── BedPreview.vue  # canvas: bed, toolpath, bbox, corners, head
+│   │   ├── JogPanel.vue    # XY arrow pad, step select, home
+│   │   ├── ZPanel.vue      # Z target input + nudge buttons
+│   │   ├── DotsPanel.vue   # corner-dot power/time + fire button
+│   │   ├── RunPanel.vue    # override, dry run, progress, run/stop
 │   │   └── LogPane.vue     # mono serial console (last 2000 lines)
 │   └── lib/
-│       ├── gcode.js        # pure parser (Node-tested)
+│       ├── gcode.js        # pure parser + word helpers (Node-tested)
 │       ├── marlin.js       # Web Serial link, serialized ok-wait queue
-│       ├── store.js        # reactive state + connect/home/jog/dots/run actions
+│       ├── store.js        # status machine + machine actions
+│       ├── settings.js     # localStorage schema: read, validate, persist
+│       ├── confirm.js      # promise-based confirmation dialog state
 │       └── theme.js        # token → rgba() resolver for canvas
 └── tests/
-    ├── gcode.test.mjs      # parser unit tests (plain Node)
+    ├── fixtures/           # vendored Lasertools .ngc samples
+    ├── gcode.test.mjs      # parser unit tests (node --test)
+    ├── marlin.test.mjs     # protocol tests against a fake serial port
+    ├── settings.test.mjs   # settings schema tests
     └── preview.screenshot.mjs  # Playwright preview captures → tests/screenshots/
 ```
 
@@ -125,13 +146,15 @@ entries). Everything else is reused from Reclaim UI.
 
 ## Sample G-code
 
-The reference project ships test files at:
-
-```
-/home/antero/Projects/laser cutter/gcode/output.ngc
-/home/antero/Projects/laser cutter/gcode/test_grid.ngc
-/home/antero/Projects/laser cutter/gcode/test_paths.ngc
-```
+Small Lasertools samples are vendored in `tests/fixtures/` (`output.ngc`,
+`test_grid.ngc`, `test_paths.ngc`, `test_grid_low.ngc`) so tests and screenshots
+run without any external checkout. The reference project keeps its originals at
+`/home/antero/Projects/laser cutter/gcode/`.
 
 `test_grid.ngc` is a good first preview and dry run: power increases left → right and
-speed increases bottom → top. The parser tests read those files directly.
+speed increases bottom → top. The parser tests read the vendored copies.
+
+The parser also tolerates generic G-code beyond Lasertools output: `N` line
+numbers, `*checksum` suffixes, zero-padded codes (`G01`), and modal bare-axis
+continuation lines (`X10 Y20` repeating the previous `G0`/`G1`). Arcs (`G2`/`G3`)
+are approximated as straight moves with a warning.
